@@ -212,7 +212,7 @@ if __name__ == "__main__":
 
         raft = RAFT_bi(
             "./pretrained_models/upscale_a_video/propagator/raft-things.pth",
-            device="cpu",
+            device=UAV_device,
         )
         raft.eval()
         propagator = Propagation(4, learnable=False)
@@ -226,15 +226,15 @@ if __name__ == "__main__":
     print("RAFT model loaded. Propagator initialized.")
 
     print(f"  - Moving pipeline components to {UAV_device} with {torch_dtype}...")
-    pipeline.to(UAV_device)
-    pipeline.vae.eval()
-    pipeline.unet.eval()
     if torch_dtype == torch.float16:
         pipeline.vae.half()
         pipeline.unet.half()
     elif torch_dtype == torch.float32:
         pipeline.vae.float()
         pipeline.unet.float()
+    pipeline.to(UAV_device)
+    pipeline.vae.eval()
+    pipeline.unet.eval()
     print("  - Pipeline components moved and configured.")
 
     ## load LLaVA
@@ -313,27 +313,46 @@ if __name__ == "__main__":
         print("\nLLaVA captioning disabled.")
 
     ## input
-    image_folder = None
     current_idx = 0
-    if args.input_path.lower().endswith(VIDEO_EXTENSIONS):  # input a video
-        is_video = True
-        video_list = [args.input_path]
-    elif os.path.isdir(args.input_path) and os.listdir(args.input_path)[0].endswith(
-        IMAGE_EXTENSIONS
-    ):  # input a image folder
-        is_video = False
-        video_list = [args.input_path]
-        image_folder = args.input_path
-    elif os.path.isdir(args.input_path) and os.listdir(args.input_path)[0].endswith(
-        VIDEO_EXTENSIONS
-    ):  # input a video folder
-        is_video = True
-        video_list = get_video_paths(args.input_path)
-    else:
-        raise ValueError(
-            f"Invalid input: '{args.input_path}' should be a path to a video file \
-            or a folder containing videos."
+
+    def is_video_file(p):
+        return p.lower().endswith(VIDEO_EXTENSIONS)
+
+    def is_image_file(p):
+        return p.lower().endswith(IMAGE_EXTENSIONS)
+
+    if os.path.isfile(args.input_path):
+        if is_video_file(args.input_path):
+            is_video = True
+            video_list = [args.input_path]
+            image_folder = None
+        elif is_image_file(args.input_path):
+            is_video = False
+            video_list = [os.path.dirname(args.input_path)]
+            image_folder = os.path.dirname(args.input_path)
+        else:
+            raise ValueError("Unsupported file type given as input_path.")
+    elif os.path.isdir(args.input_path):
+        entries = sorted(
+            f
+            for f in os.listdir(args.input_path)
+            if is_video_file(f) or is_image_file(f)
         )
+        if not entries:
+            raise ValueError("No images or videos found in the given directory.")
+
+        first_entry = entries[0]
+        if is_video_file(first_entry):
+            is_video = True
+            video_list = get_video_paths(args.input_path)
+            image_folder = None
+        else:
+            is_video = False
+            video_list = [args.input_path]
+            image_folder = args.input_path
+    else:
+        raise ValueError("input_path must be a file or folder.")
+
     os.makedirs(args.output_path, exist_ok=True)
 
     print("Upscale-A-Video Pipeline ready.")
@@ -355,7 +374,8 @@ if __name__ == "__main__":
         if is_video:
             reader = imageio.get_reader(video_path)
             meta = reader.get_meta_data()
-            fps = meta.get("fps", 30)
+            fps = max(meta.get("fps", 30), 1)
+
             n_frames = reader.count_frames()
             print(f"  Detected ~{n_frames} frames.")
 
@@ -435,6 +455,7 @@ if __name__ == "__main__":
         )
 
         # chunking
+        prev_tail_frame = None
         generator = torch.Generator(device=UAV_device).manual_seed(10)
         chunk_idx = 0
         start_time = time.time()
@@ -443,6 +464,7 @@ if __name__ == "__main__":
             reader = imageio.get_reader(video_path)
         else:
             pass
+
         while True:
             print(f"\n{index_str} Reading chunk {chunk_idx + 1}...")
             vframes_chunk_cpu, next_idx = read_frames_chunk(
@@ -452,12 +474,18 @@ if __name__ == "__main__":
                 chunk_size=args.chunk_size,
                 current_idx=current_idx,
             )  # T C H W [0, 255], CPU
+
             if vframes_chunk_cpu is None:
                 if is_video:
                     print(f"{index_str} End of video reached.")
                 else:
                     print(f"{index_str} End of image folder reached.")
                 break
+
+            if prev_tail_frame is not None:
+                vframes_chunk_cpu = torch.cat(
+                    [prev_tail_frame, vframes_chunk_cpu], dim=0
+                )
 
             if not is_video:
                 current_idx = next_idx
@@ -480,22 +508,19 @@ if __name__ == "__main__":
 
             # calculate optical flow
             flows_bi_chunk = None
-            if raft is not None and t_chunk > 1:  # need at least 2 frames for flow
+            if raft is not None and t_chunk > 1:
                 print(f"\tCalculating flow for chunk {chunk_idx + 1}...")
-                raft.to(UAV_device)
                 with torch.no_grad():
-                    # RAFT expects B C T H W
-                    raft_input = (
-                        vframes_chunk.float()
-                        if raft.dtype == torch.float32
-                        else vframes_chunk
-                    )
+                    raft_input = vframes_chunk.float()
                     flows_forward, flows_backward = raft.forward_slicing(raft_input)
+
                     flows_bi_chunk = [
-                        flows_forward.to(dtype=torch_dtype),
-                        flows_backward.to(dtype=torch_dtype),
+                        flows_forward,
+                        flows_backward,
                     ]
                 print(f"\tFlow calculated.")
+            else:
+                flows_bi_chunk = None
 
             perform_tile_chunk = args.perform_tile or (h * w >= 384 * 384)
             output_chunk = None
@@ -614,36 +639,19 @@ if __name__ == "__main__":
                             final_output_end_y = output_start_y + place_h
                             final_output_end_x = output_start_x + place_w
 
-                            if (
-                                place_h > 0
-                                and place_w > 0
-                                and tile_out_start_y < tile_out_end_y
-                                and tile_out_start_x < tile_out_end_x
-                                and output_start_y < final_output_end_y
-                                and output_start_x < final_output_end_x
-                                and final_output_end_y <= output_h
-                                and final_output_end_x <= output_w
-                            ):
-
-                                output_chunk[
-                                    :,
-                                    :,
-                                    :,
-                                    output_start_y:final_output_end_y,
-                                    output_start_x:final_output_end_x,
-                                ] = output_tile[
-                                    :,
-                                    :,
-                                    :,
-                                    tile_out_start_y:tile_out_end_y,
-                                    tile_out_start_x:tile_out_end_x,
-                                ]
-                            else:
-                                print(
-                                    f"\tWarning: Skipping placement for tile {x},{y} due to boundary/size mismatch during cropping/placing."
-                                )
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
+                            output_chunk[
+                                :,
+                                :,
+                                :,
+                                output_start_y:final_output_end_y,
+                                output_start_x:final_output_end_x,
+                            ] = output_tile[
+                                :,
+                                :,
+                                :,
+                                tile_out_start_y:tile_out_end_y,
+                                tile_out_start_x:tile_out_end_x,
+                            ]
 
                 else:
                     print(f"\tProcessing chunk w/o tile...")
@@ -668,7 +676,7 @@ if __name__ == "__main__":
                 ).contiguous()
 
                 # color correction
-                if args.color_fix in ["AdaIn", "Wavelet"]:
+                if args.color_fix in ["AdaIn", "Wavelet"] and t_chunk > 1:
                     print(f"\tApplying {args.color_fix} color correction...")
                     with torch.no_grad():
                         vframes_chunk_orig_float = (
@@ -680,9 +688,6 @@ if __name__ == "__main__":
                             size=(output_h, output_w),
                             mode="bicubic",
                             align_corners=False,
-                        )
-                        vframes_chunk_resized = vframes_chunk_resized.to(
-                            dtype=torch_dtype
                         )
 
                         output_chunk_corrected = output_chunk
@@ -710,13 +715,9 @@ if __name__ == "__main__":
 
                         output_chunk = output_chunk_corrected
 
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
                     print(f"\tColor correction applied.")
 
                 output_chunk_cpu = output_chunk.float().cpu()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
                 # T C H W [-1, 1] -> T H W C [0, 255] uint8
                 output_chunk_cpu = (output_chunk_cpu / 2.0 + 0.5).clamp(0, 1) * 255.0
@@ -726,10 +727,16 @@ if __name__ == "__main__":
                 output_chunk_uint8 = output_chunk_cpu.numpy().astype(np.uint8)
 
                 print(f"\tWriting {output_chunk_uint8.shape[0]} frames to video...")
-                for frame_idx in range(output_chunk_uint8.shape[0]):
+                start_write_idx = (
+                    1 if (prev_tail_frame is not None and chunk_idx > 0) else 0
+                )
+                for frame_idx in range(start_write_idx, output_chunk_uint8.shape[0]):
+                    # for frame_idx in range(output_chunk_uint8.shape[0]):
                     writer.append_data(output_chunk_uint8[frame_idx])
                     if args.save_image:
-                        frame_num = total_frames_processed + frame_idx
+                        frame_num = total_frames_processed + (
+                            frame_idx - start_write_idx
+                        )
                         if frame_idx == 0 and chunk_idx == 0:
                             save_img_root = os.path.join(args.output_path, "frame")
                             save_img_dir = os.path.join(save_img_root, save_name)
@@ -742,16 +749,19 @@ if __name__ == "__main__":
                         imageio.imwrite(save_img_path, output_chunk_uint8[frame_idx])
 
                 processed_count_in_chunk = output_chunk_uint8.shape[0]
-                total_frames_processed += processed_count_in_chunk
+                total_frames_processed += processed_count_in_chunk - start_write_idx
                 print(
                     f"{index_str} Finished processing chunk {chunk_idx + 1}. Total frames processed: {total_frames_processed}"
                 )
                 processing_successful = True
+
+            prev_tail_frame = vframes_chunk_cpu[-1:].clone()
             chunk_idx += 1
 
         end_time = time.time()
         run_time = end_time - start_time
         writer.close()
+        prev_tail_frame = prev_tail_flow_f = prev_tail_flow_b = None
         if reader is not None:
             reader.close()
 
