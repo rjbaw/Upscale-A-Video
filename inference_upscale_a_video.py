@@ -130,7 +130,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--chunk_size",
         type=int,
-        default=8,
+        default=4,
         help="Number of frames per chunk to process at once.",
     )
     parser.add_argument(
@@ -529,20 +529,17 @@ if __name__ == "__main__":
                 if perform_tile_chunk:
                     tile_height = min(args.tile_size, h)
                     tile_width = min(args.tile_size, w)
-                    tile_overlap = min(
-                        args.tile_overlap, tile_height // 2, tile_width // 2
-                    )
+                    tile_overlap = min(args.tile_overlap, tile_height // 2, tile_width // 2)
 
+                    # seam blend
+                    scale = output_h // h
                     output_shape_chunk = (b, c, t_chunk, output_h, output_w)
-                    output_chunk = torch.zeros(
-                        output_shape_chunk, dtype=torch_dtype, device=UAV_device
-                    )
+                    accum_chunk = torch.zeros(output_shape_chunk, dtype=torch_dtype, device=UAV_device)
+                    weight_chunk = torch.zeros((1, 1, 1, output_h, output_w), dtype=torch_dtype, device=UAV_device)
 
                     tiles_x = math.ceil(w / tile_width)
                     tiles_y = math.ceil(h / tile_height)
-                    print(
-                        f"\tProcessing chunk w/ tile patches [{tiles_x}x{tiles_y}], size={tile_width}x{tile_height}, overlap={tile_overlap}..."
-                    )
+                    print(f"\tProcessing chunk w/ tile patches [{tiles_x}x{tiles_y}], size={tile_width}x{tile_height}, overlap={tile_overlap}...")
 
                     for y in range(tiles_y):
                         for x in range(tiles_x):
@@ -550,57 +547,23 @@ if __name__ == "__main__":
                             input_end_y = min(input_start_y + tile_height, h)
                             input_start_x = x * tile_width
                             input_end_x = min(input_start_x + tile_width, w)
-                            pad_y_start = max(0, input_start_y - tile_overlap)
-                            pad_y_end = min(h, input_end_y + tile_overlap)
-                            pad_x_start = max(0, input_start_x - tile_overlap)
-                            pad_x_end = min(w, input_end_x + tile_overlap)
 
-                            input_tile = vframes_chunk[
-                                :,
-                                :,
-                                :,
-                                pad_y_start:pad_y_end,
-                                pad_x_start:pad_x_end,
-                            ]
+                            pad_y_start = max(0, input_start_y - tile_overlap)
+                            pad_y_end   = min(h, input_end_y + tile_overlap)
+                            pad_x_start = max(0, input_start_x - tile_overlap)
+                            pad_x_end   = min(w, input_end_x + tile_overlap)
+
+                            input_tile = vframes_chunk[:, :, :, pad_y_start:pad_y_end, pad_x_start:pad_x_end]
 
                             flows_bi_tile = None
                             if flows_bi_chunk is not None:
-                                # slice the chunk flows for this tile region
-                                if (
-                                    flows_bi_chunk[0] is not None
-                                    and flows_bi_chunk[0].ndim == 5
-                                    and flows_bi_chunk[1] is not None
-                                    and flows_bi_chunk[1].ndim == 5
-                                ):
-                                    flows_f_tile = flows_bi_chunk[0][
-                                        :,
-                                        :,
-                                        :,
-                                        pad_y_start:pad_y_end,
-                                        pad_x_start:pad_x_end,
-                                    ]
-                                    flows_b_tile = flows_bi_chunk[1][
-                                        :,
-                                        :,
-                                        :,
-                                        pad_y_start:pad_y_end,
-                                        pad_x_start:pad_x_end,
-                                    ]
+                                if (flows_bi_chunk[0] is not None and flows_bi_chunk[0].ndim == 5
+                                    and flows_bi_chunk[1] is not None and flows_bi_chunk[1].ndim == 5):
+                                    flows_f_tile = flows_bi_chunk[0][:, :, :, pad_y_start:pad_y_end, pad_x_start:pad_x_end]
+                                    flows_b_tile = flows_bi_chunk[1][:, :, :, pad_y_start:pad_y_end, pad_x_start:pad_x_end]
+                                    if flows_f_tile.numel() > 0 and flows_b_tile.numel() > 0:
+                                        flows_bi_tile = [flows_f_tile, flows_b_tile]
 
-                                    if (
-                                        flows_f_tile.numel() > 0
-                                        and flows_b_tile.numel() > 0
-                                    ):
-                                        flows_bi_tile = [
-                                            flows_f_tile,
-                                            flows_b_tile,
-                                        ]
-                                    else:
-                                        flows_bi_tile = None
-                                else:
-                                    flows_bi_tile = None
-
-                            # upscale tile
                             output_tile = pipeline(
                                 prompt=prompt,
                                 image=input_tile,
@@ -610,48 +573,51 @@ if __name__ == "__main__":
                                 guidance_scale=args.guidance_scale,
                                 noise_level=args.noise_level,
                                 negative_prompt=args.n_prompt,
-                                propagation_steps=(
-                                    args.propagation_steps if raft is not None else []
-                                ),
-                            ).images  # expect B C T H_tile_up W_tile_up
+                                propagation_steps=(args.propagation_steps if (raft is not None and t_chunk > 1) else []),
+                            ).images  # B C T H_pad_up W_pad_up
 
-                            output_start_y = input_start_y * 4
-                            output_end_y = input_end_y * 4
-                            output_start_x = input_start_x * 4
-                            output_end_x = input_end_x * 4
+                            out_pad_y0 = pad_y_start * scale
+                            out_pad_x0 = pad_x_start * scale
+                            gen_h, gen_w = output_tile.shape[-2:]
+                            out_pad_y1 = min(out_pad_y0 + gen_h, output_h)
+                            out_pad_x1 = min(out_pad_x0 + gen_w, output_w)
+                            place_h = out_pad_y1 - out_pad_y0
+                            place_w = out_pad_x1 - out_pad_x0
+                            if place_h <= 0 or place_w <= 0:
+                                continue
 
-                            # based on the non-overlapped region of the input tile
-                            tile_out_start_y = (input_start_y - pad_y_start) * 4
-                            tile_out_end_y = (
-                                tile_out_start_y + (input_end_y - input_start_y) * 4
-                            )
-                            tile_out_start_x = (input_start_x - pad_x_start) * 4
-                            tile_out_end_x = (
-                                tile_out_start_x + (input_end_x - input_start_x) * 4
-                            )
-                            tile_h_gen, tile_w_gen = output_tile.shape[-2:]
-                            tile_out_end_y = min(tile_out_end_y, tile_h_gen)
-                            tile_out_end_x = min(tile_out_end_x, tile_w_gen)
+                            output_tile = output_tile[:, :, :, :place_h, :place_w]
 
-                            # adjust placement size if generated tile was smaller at edges
-                            place_h = tile_out_end_y - tile_out_start_y
-                            place_w = tile_out_end_x - tile_out_start_x
-                            final_output_end_y = output_start_y + place_h
-                            final_output_end_x = output_start_x + place_w
+                            # effective overlaps
+                            eff_top    = (input_start_y - pad_y_start) * scale
+                            eff_bottom = (pad_y_end - input_end_y) * scale
+                            eff_left   = (input_start_x - pad_x_start) * scale
+                            eff_right  = (pad_x_end - input_end_x) * scale
 
-                            output_chunk[
-                                :,
-                                :,
-                                :,
-                                output_start_y:final_output_end_y,
-                                output_start_x:final_output_end_x,
-                            ] = output_tile[
-                                :,
-                                :,
-                                :,
-                                tile_out_start_y:tile_out_end_y,
-                                tile_out_start_x:tile_out_end_x,
-                            ]
+                            fade_top    = int(min(max(eff_top,    0), place_h))
+                            fade_bottom = int(min(max(eff_bottom, 0), place_h))
+                            fade_left   = int(min(max(eff_left,   0), place_w))
+                            fade_right  = int(min(max(eff_right,  0), place_w))
+
+                            # build separable cosine hann feather mask
+                            y_idx = torch.arange(place_h, device=UAV_device, dtype=output_tile.dtype)
+                            wy_top = (0.5 - 0.5 * torch.cos(math.pi * torch.clamp(y_idx / fade_top, 0, 1))) if fade_top > 0 else torch.ones_like(y_idx)
+                            wy_bot = (0.5 - 0.5 * torch.cos(math.pi * torch.clamp((place_h - 1 - y_idx) / fade_bottom, 0, 1))) if fade_bottom > 0 else torch.ones_like(y_idx)
+                            wy = torch.minimum(wy_top, wy_bot)
+
+                            x_idx = torch.arange(place_w, device=UAV_device, dtype=output_tile.dtype)
+                            wx_left  = (0.5 - 0.5 * torch.cos(math.pi * torch.clamp(x_idx / fade_left, 0, 1))) if fade_left > 0 else torch.ones_like(x_idx)
+                            wx_right = (0.5 - 0.5 * torch.cos(math.pi * torch.clamp((place_w - 1 - x_idx) / fade_right, 0, 1))) if fade_right > 0 else torch.ones_like(x_idx)
+                            wx = torch.minimum(wx_left, wx_right)
+
+                            mask2d = (wy.view(place_h, 1) * wx.view(1, place_w)).clamp_(0, 1)
+                            mask = mask2d.view(1, 1, 1, place_h, place_w)  # broadcast over B,C,T
+
+                            accum_chunk[:, :, :, out_pad_y0:out_pad_y1, out_pad_x0:out_pad_x1] += output_tile * mask
+                            weight_chunk[:, :, :, out_pad_y0:out_pad_y1, out_pad_x0:out_pad_x1] += mask
+
+                    eps = torch.finfo(accum_chunk.dtype).eps
+                    output_chunk = accum_chunk / weight_chunk.clamp_min(eps)
 
                 else:
                     print(f"\tProcessing chunk w/o tile...")
@@ -664,10 +630,8 @@ if __name__ == "__main__":
                         guidance_scale=args.guidance_scale,
                         noise_level=args.noise_level,
                         negative_prompt=args.n_prompt,
-                        propagation_steps=(
-                            args.propagation_steps if raft is not None else []
-                        ),
-                    ).images  # expect B C T H_up W_up [-1, 1]
+                        propagation_steps=(args.propagation_steps if (raft is not None and t_chunk > 1) else []),
+                    ).images  # B C T H_up W_up [-1, 1]
 
                 # post-process chunk
                 # output is B C T H W [-1, 1] on UAV_device
